@@ -16,8 +16,16 @@ Usage:
 """
 
 import argparse
+import os
 import sys
 from pathlib import Path
+
+# Load environment variables from .env file
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # dotenv not installed, use environment variables directly
 
 import torch
 from rich.console import Console
@@ -380,9 +388,9 @@ Examples:
     train_group.add_argument(
         "--dataset",
         type=str,
-        default="fleurs",
+        default="indicvoices",
         choices=["fleurs", "indicvoices"],
-        help="Dataset: fleurs (no auth) or indicvoices (requires HuggingFace login)",
+        help="Dataset: indicvoices (larger, needs .env token) or fleurs (no auth, smaller)",
     )
     train_group.add_argument(
         "--max-audio-length",

@@ -19,6 +19,8 @@ dependencies = [
     "jiwer>=3.0.0",
     "yt-dlp>=2025.12.8",
     "torchcodec>=0.10.0",
+    "python-dotenv>=1.0.0",
+    "huggingface-hub>=0.20.0",
 ]
 
 [project.scripts]

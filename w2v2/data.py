@@ -59,16 +59,16 @@ class DataConfig:
     
     Supported datasets:
     - "fleurs": Google FLEURS Hindi (no auth required, smaller ~2k samples)
-    - "indicvoices": AI4Bharat IndicVoices Hindi (requires HuggingFace auth, larger)
+    - "indicvoices": AI4Bharat IndicVoices Hindi (requires HuggingFace auth, larger ~7k+ samples)
     
-    For indicvoices, you need to:
+    For indicvoices, set HUGGINGFACE_TOKEN in .env file:
     1. Accept license at https://huggingface.co/datasets/ai4bharat/IndicVoices
-    2. Run: huggingface-cli login
+    2. Create .env file with: HUGGINGFACE_TOKEN=hf_your_token_here
     """
     # Dataset selection: "fleurs" or "indicvoices"
-    dataset_type: str = "fleurs"  # Default to fleurs (no auth required)
-    dataset_name: str = "google/fleurs"  # HuggingFace dataset path
-    language: str = "hi_in"  # Language code
+    dataset_type: str = "indicvoices"  # Default to indicvoices (larger dataset)
+    dataset_name: str = "ai4bharat/IndicVoices"  # HuggingFace dataset path
+    language: str = "hindi"  # Language code
     sampling_rate: int = 16000
     max_audio_length: float = 15.0  # seconds
     min_audio_length: float = 0.5   # seconds
@@ -121,6 +121,9 @@ def prepare_dataset(
     
     info(f"Loading {config.dataset_name} ({config.language})...")
     
+    # Get HF token for authenticated datasets
+    hf_token = load_hf_token()
+    
     # Load dataset based on type
     if config.dataset_type == "fleurs":
         dataset = load_dataset(
@@ -135,13 +138,19 @@ def prepare_dataset(
         
     elif config.dataset_type == "indicvoices":
         # IndicVoices dataset - requires HuggingFace authentication
-        info("Note: IndicVoices requires HuggingFace authentication.")
-        info("If you get 401 errors, run: huggingface-cli login")
+        if hf_token:
+            info("Using HuggingFace token from environment")
+            authenticate_huggingface(hf_token)
+        else:
+            warning("No HuggingFace token found. Set HUGGINGFACE_TOKEN in .env file")
+            warning("If you get 401 errors, run: huggingface-cli login")
+        
         dataset = load_dataset(
             "ai4bharat/IndicVoices",
             "hindi",  # Language config name
             cache_dir=config.cache_dir,
             trust_remote_code=True,
+            token=hf_token,  # Pass token for authentication
         )
         text_column = "transcript"
         audio_column = "audio"
@@ -153,6 +162,7 @@ def prepare_dataset(
             config.dataset_name,
             cache_dir=config.cache_dir,
             trust_remote_code=True,
+            token=hf_token,
         )
         text_column = "transcript" if "transcript" in dataset["train"].column_names else "transcription"
         audio_column = "audio"
