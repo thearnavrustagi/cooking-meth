@@ -1,0 +1,37 @@
+[project]
+name = "hindi-phoneme-recognizer"
+version = "0.1.0"
+description = "Hindi speech to phoneme recognition with timestamps using wav2vec2"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.0.0",
+    "torchaudio>=2.0.0",
+    "transformers>=4.35.0",
+    "datasets>=2.14.0,<3.0.0",
+    "accelerate>=0.24.0",
+    "ctc-segmentation>=1.7.0",
+    "rich>=13.0.0",
+    "soundfile>=0.12.0",
+    "librosa>=0.10.0",
+    "numpy>=1.24.0",
+    "evaluate>=0.4.0",
+    "jiwer>=3.0.0",
+    "yt-dlp>=2025.12.8",
+    "torchcodec>=0.10.0",
+]
+
+[project.scripts]
+hindi-phoneme = "main:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["w2v2", "lib"]
+
+[dependency-groups]
+dev = [
+    "ipython>=8.0.0",
+]
