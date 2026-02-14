@@ -17,8 +17,8 @@ except ImportError:
     CTC_SEGMENTATION_AVAILABLE = False
 
 from w2v2.phoneme import text_to_phoneme_list, devanagari_to_ipa, ipa_to_phoneme_list
-from w2v2.data import get_sample_audio, load_vocabulary
-from lib.logger import console, info, success, error, warning, print_phonemes
+from w2v2.data import get_sample_audio, load_vocabulary, prepare_dataset, PhonemeDataCollator
+from lib.logger import console, info, success, error, warning, print_phonemes, print_results
 
 
 def _get_default_device() -> str:
@@ -38,11 +38,12 @@ class InferenceConfig:
     sampling_rate: int = 16000
     # CTC segmentation parameters
     blank_token_id: int = 0
-    frame_duration_ms: float = 20.0  # wav2vec2 outputs at ~50fps = 20ms per frame
+    frame_duration_ms: float = None  # Auto-detect from model if None
     
     def __post_init__(self):
         if self.device is None:
             self.device = _get_default_device()
+        # frame_duration_ms will be set by PhonemeRecognizer based on model config
 
 
 class PhonemeRecognizer:
@@ -59,6 +60,17 @@ class PhonemeRecognizer:
         self.model = Wav2Vec2ForCTC.from_pretrained(config.model_path)
         self.model.to(self.device)
         self.model.eval()
+        
+        # Auto-detect frame duration from model config
+        if config.frame_duration_ms is None:
+            # Calculate total stride from conv_stride
+            total_stride = 1
+            for s in self.model.config.conv_stride:
+                total_stride *= s
+            # At 16kHz, each sample is 1/16000 seconds = 0.0625ms
+            # frame_duration_ms = total_stride * (1000 / sampling_rate)
+            self.config.frame_duration_ms = total_stride / 16.0  # 16 samples per ms at 16kHz
+            info(f"Auto-detected frame duration: {self.config.frame_duration_ms}ms (stride={total_stride})")
         
         # Load vocabulary for decoding
         vocab_path = os.path.join(config.model_path, "vocab.json")
@@ -105,10 +117,19 @@ class PhonemeRecognizer:
         
         return log_probs.cpu().numpy()[0]
     
-    def greedy_decode(self, logits: np.ndarray) -> tuple[list[str], list[tuple[float, float]]]:
+    def greedy_decode(self, logits: np.ndarray, silence_threshold_ms: float = 200.0) -> tuple[list[str], list[tuple[float, float]]]:
         """
         Greedy CTC decoding with timestamps.
         Returns phonemes and their (start, end) timestamps in seconds.
+        
+        Key insight: In CTC, blank tokens are interspersed with phoneme predictions.
+        We should NOT end a segment when we see a blank - only when:
+        1. A DIFFERENT non-blank phoneme appears
+        2. There's a long silence (many consecutive blanks exceeding silence_threshold_ms)
+        
+        Args:
+            logits: Frame-level log probabilities from the model
+            silence_threshold_ms: End segment if blanks exceed this duration (default 200ms)
         """
         # Get predicted token IDs
         pred_ids = np.argmax(logits, axis=-1)
@@ -122,53 +143,209 @@ class PhonemeRecognizer:
         timestamps = []
         
         frame_duration = self.config.frame_duration_ms / 1000.0  # Convert to seconds
+        silence_threshold_frames = int(silence_threshold_ms / self.config.frame_duration_ms)
         
-        prev_token = None
-        start_frame = 0
+        # Track current phoneme segment
+        current_phoneme_id = None  # The active non-blank phoneme
+        current_phoneme = None
+        start_frame = None
+        last_phoneme_frame = None  # Last frame where we saw the current phoneme (not blank)
+        blank_count = 0  # Consecutive blank frames
         
         for frame_idx, token_id in enumerate(pred_ids):
-            # Skip blank tokens and repeated tokens
-            if token_id == self.config.blank_token_id:
-                if prev_token is not None and prev_token != self.config.blank_token_id:
-                    # End of current phoneme
-                    end_time = frame_idx * frame_duration
+            is_blank = (token_id == self.config.blank_token_id)
+            
+            if is_blank:
+                blank_count += 1
+                
+                # Check for silence (long blank span) - end current segment
+                if current_phoneme is not None and blank_count >= silence_threshold_frames:
+                    # End the segment at the last phoneme frame
+                    end_time = (last_phoneme_frame + 1) * frame_duration
                     start_time = start_frame * frame_duration
                     
-                    phoneme = self.id_to_phoneme.get(prev_token, "<unk>")
-                    if phoneme not in ["<pad>", "<unk>", "|"]:
-                        phonemes.append(phoneme)
+                    if current_phoneme not in ["<pad>", "<unk>", "|"]:
+                        phonemes.append(current_phoneme)
                         timestamps.append((start_time, end_time))
+                    
+                    current_phoneme_id = None
+                    current_phoneme = None
+                    start_frame = None
+                    last_phoneme_frame = None
                 
-                prev_token = token_id
                 continue
             
-            if token_id != prev_token:
-                # New phoneme starts
-                if prev_token is not None and prev_token != self.config.blank_token_id:
-                    # End previous phoneme
-                    end_time = frame_idx * frame_duration
-                    start_time = start_frame * frame_duration
-                    
-                    phoneme = self.id_to_phoneme.get(prev_token, "<unk>")
-                    if phoneme not in ["<pad>", "<unk>", "|"]:
-                        phonemes.append(phoneme)
-                        timestamps.append((start_time, end_time))
-                
-                start_frame = frame_idx
+            # Non-blank token
+            phoneme = self.id_to_phoneme.get(token_id, "<unk>")
             
-            prev_token = token_id
+            # Skip special tokens
+            if phoneme in ["<pad>", "<unk>", "|"]:
+                continue
+            
+            # Reset blank counter since we saw a non-blank
+            blank_count = 0
+            
+            if current_phoneme is None:
+                # Start new segment
+                current_phoneme_id = token_id
+                current_phoneme = phoneme
+                start_frame = frame_idx
+                last_phoneme_frame = frame_idx
+                
+            elif token_id == current_phoneme_id:
+                # Same phoneme continues - extend the segment
+                last_phoneme_frame = frame_idx
+                
+            else:
+                # DIFFERENT phoneme - end current segment and start new one
+                end_time = (last_phoneme_frame + 1) * frame_duration
+                start_time = start_frame * frame_duration
+                
+                if current_phoneme not in ["<pad>", "<unk>", "|"]:
+                    phonemes.append(current_phoneme)
+                    timestamps.append((start_time, end_time))
+                
+                # Start new segment
+                current_phoneme_id = token_id
+                current_phoneme = phoneme
+                start_frame = frame_idx
+                last_phoneme_frame = frame_idx
         
         # Handle last phoneme
-        if prev_token is not None and prev_token != self.config.blank_token_id:
-            end_time = len(pred_ids) * frame_duration
+        if current_phoneme is not None:
+            end_time = (last_phoneme_frame + 1) * frame_duration
             start_time = start_frame * frame_duration
             
-            phoneme = self.id_to_phoneme.get(prev_token, "<unk>")
-            if phoneme not in ["<pad>", "<unk>", "|"]:
-                phonemes.append(phoneme)
+            if current_phoneme not in ["<pad>", "<unk>", "|"]:
+                phonemes.append(current_phoneme)
                 timestamps.append((start_time, end_time))
         
         return phonemes, timestamps
+    
+    def extend_to_fill_gaps(
+        self,
+        phonemes: list[str],
+        timestamps: list[tuple[float, float]],
+        audio_duration: float,
+    ) -> tuple[list[str], list[tuple[float, float]]]:
+        """
+        Post-process timestamps to extend each phoneme until the next one starts.
+        
+        CTC models often output "spiky" predictions where phonemes only last 1-2 frames.
+        This function extends each phoneme's duration to fill the gap until the next phoneme,
+        which is more representative of actual speech where sounds are continuous.
+        
+        Args:
+            phonemes: List of phoneme strings
+            timestamps: List of (start, end) tuples
+            audio_duration: Total audio duration in seconds
+        
+        Returns:
+            Same phonemes with extended timestamps
+        """
+        if not phonemes:
+            return phonemes, timestamps
+        
+        extended_timestamps = []
+        
+        for i, (phoneme, (start, end)) in enumerate(zip(phonemes, timestamps)):
+            # Extend end time to the start of the next phoneme
+            if i < len(phonemes) - 1:
+                next_start = timestamps[i + 1][0]
+                new_end = next_start
+            else:
+                # Last phoneme extends to end of audio
+                new_end = audio_duration
+            
+            extended_timestamps.append((start, new_end))
+        
+        return phonemes, extended_timestamps
+    
+    def greedy_decode_raw(self, logits: np.ndarray) -> tuple[list[str], list[tuple[float, float]]]:
+        """
+        Raw frame-level decoding WITHOUT any CTC collapsing.
+        
+        Returns every frame's prediction as a separate entry, showing exactly
+        what the model outputs including blanks and repeated tokens.
+        
+        Useful for debugging and understanding model behavior.
+        """
+        # Get predicted token IDs
+        pred_ids = np.argmax(logits, axis=-1)
+        
+        # Debug: show distribution of predicted tokens
+        unique, counts = np.unique(pred_ids, return_counts=True)
+        token_dist = {self.id_to_phoneme.get(int(u), f"id={u}"): int(c) for u, c in zip(unique, counts)}
+        info(f"Token distribution: {token_dist}")
+        info(f"Total frames: {len(pred_ids)}")
+        
+        phonemes = []
+        timestamps = []
+        
+        frame_duration = self.config.frame_duration_ms / 1000.0  # Convert to seconds
+        
+        # Group consecutive identical tokens into spans (but don't collapse different tokens)
+        current_token_id = None
+        current_phoneme = None
+        start_frame = 0
+        
+        for frame_idx, token_id in enumerate(pred_ids):
+            phoneme = self.id_to_phoneme.get(int(token_id), f"<id={token_id}>")
+            
+            # Replace special tokens with readable names
+            if token_id == self.config.blank_token_id:
+                phoneme = "_"  # Use underscore for blank/pad
+            
+            if token_id != current_token_id:
+                # Save previous span
+                if current_phoneme is not None:
+                    start_time = start_frame * frame_duration
+                    end_time = frame_idx * frame_duration
+                    phonemes.append(current_phoneme)
+                    timestamps.append((start_time, end_time))
+                
+                # Start new span
+                current_token_id = token_id
+                current_phoneme = phoneme
+                start_frame = frame_idx
+        
+        # Handle last span
+        if current_phoneme is not None:
+            start_time = start_frame * frame_duration
+            end_time = len(pred_ids) * frame_duration
+            phonemes.append(current_phoneme)
+            timestamps.append((start_time, end_time))
+        
+        return phonemes, timestamps
+    
+    def recognize_raw(
+        self,
+        audio_path: str,
+    ) -> tuple[list[str], list[tuple[float, float]]]:
+        """
+        Get raw frame-level predictions without CTC collapsing.
+        
+        Args:
+            audio_path: Path to audio file
+        
+        Returns:
+            Tuple of (tokens, timestamps) showing exact model output
+        """
+        info(f"Processing (raw mode): {audio_path}")
+        
+        # Load audio
+        waveform = self.load_audio(audio_path)
+        audio_duration = len(waveform) / self.config.sampling_rate
+        info(f"Audio duration: {audio_duration:.2f}s")
+        
+        # Get model predictions
+        logits = self.get_logits(waveform)
+        info(f"Got {logits.shape[0]} frames from model ({self.config.frame_duration_ms}ms each)")
+        
+        # Decode without CTC collapsing
+        tokens, timestamps = self.greedy_decode_raw(logits)
+        
+        return tokens, timestamps
     
     def ctc_segment(
         self, 
@@ -242,6 +419,7 @@ class PhonemeRecognizer:
         audio_path: str,
         reference_text: Optional[str] = None,
         use_ctc_segmentation: bool = True,
+        extend_timestamps: bool = True,
     ) -> tuple[list[str], list[tuple[float, float]]]:
         """
         Recognize phonemes with timestamps from audio file.
@@ -250,6 +428,7 @@ class PhonemeRecognizer:
             audio_path: Path to audio file
             reference_text: Optional Devanagari text for CTC segmentation
             use_ctc_segmentation: Whether to use CTC segmentation (more accurate)
+            extend_timestamps: Extend each phoneme to fill gap until next phoneme
         
         Returns:
             Tuple of (phonemes, timestamps) where timestamps are (start, end) in seconds
@@ -258,12 +437,22 @@ class PhonemeRecognizer:
         
         # Load audio
         waveform = self.load_audio(audio_path)
+        return self.recognize_waveform(waveform, reference_text, use_ctc_segmentation, extend_timestamps)
+
+    def recognize_waveform(
+        self,
+        waveform: torch.Tensor,
+        reference_text: Optional[str] = None,
+        use_ctc_segmentation: bool = True,
+        extend_timestamps: bool = True,
+    ) -> tuple[list[str], list[tuple[float, float]]]:
+        """Recognize phonemes from a waveform tensor."""
         audio_duration = len(waveform) / self.config.sampling_rate
-        info(f"Audio duration: {audio_duration:.2f}s")
+        # info(f"Audio duration: {audio_duration:.2f}s")
         
         # Get model predictions
         logits = self.get_logits(waveform)
-        info(f"Got {logits.shape[0]} frames from model")
+        # info(f"Got {logits.shape[0]} frames from model")
         
         # Decode with timestamps
         if use_ctc_segmentation and reference_text:
@@ -271,7 +460,11 @@ class PhonemeRecognizer:
         else:
             phonemes, timestamps = self.greedy_decode(logits)
         
-        success(f"Recognized {len(phonemes)} phonemes")
+        # Extend timestamps to fill gaps (recommended for continuous speech)
+        if extend_timestamps and phonemes:
+            phonemes, timestamps = self.extend_to_fill_gaps(phonemes, timestamps, audio_duration)
+        
+        # success(f"Recognized {len(phonemes)} phonemes")
         
         return phonemes, timestamps
 
@@ -318,6 +511,8 @@ def transcribe_audio(
     output_srt: Optional[str] = None,
     reference_text: Optional[str] = None,
     device: Optional[str] = None,
+    raw_output: bool = False,
+    extend_timestamps: bool = True,
 ) -> tuple[list[str], list[tuple[float, float]]]:
     """
     Main function to transcribe audio to timestamped phonemes.
@@ -328,6 +523,8 @@ def transcribe_audio(
         output_srt: Path for output SRT file (default: same as audio with .srt extension)
         reference_text: Optional Devanagari text for better alignment
         device: Device to use (cuda/mps/cpu, auto-detects if None)
+        raw_output: If True, output raw frame-level predictions without CTC collapsing
+        extend_timestamps: Extend each phoneme to fill gap until next phoneme (default True)
     
     Returns:
         Tuple of (phonemes, timestamps)
@@ -342,19 +539,26 @@ def transcribe_audio(
     recognizer = PhonemeRecognizer(config)
     
     # Recognize
-    phonemes, timestamps = recognizer.recognize(
-        audio_path,
-        reference_text=reference_text,
-        use_ctc_segmentation=reference_text is not None,
-    )
+    if raw_output:
+        phonemes, timestamps = recognizer.recognize_raw(audio_path)
+        title = "Raw Model Output (no CTC collapse)"
+    else:
+        phonemes, timestamps = recognizer.recognize(
+            audio_path,
+            reference_text=reference_text,
+            use_ctc_segmentation=reference_text is not None,
+            extend_timestamps=extend_timestamps,
+        )
+        title = "Recognized Phonemes" + (" (extended)" if extend_timestamps else "")
     
     # Print results
-    print_phonemes(phonemes, timestamps, title="Recognized Phonemes")
+    print_phonemes(phonemes, timestamps, title=title)
     
     # Write SRT
     if output_srt is None:
         audio_path_obj = Path(audio_path)
-        output_srt = str(audio_path_obj.with_suffix(".srt"))
+        suffix = ".raw.srt" if raw_output else ".srt"
+        output_srt = str(audio_path_obj.with_suffix(suffix))
     
     write_srt(phonemes, timestamps, output_srt)
     
@@ -443,6 +647,7 @@ class BaseModelTranscriber:
         audio_path: str,
         word_level: bool = True,
         word_gap_threshold: float = 0.12,
+        silence_threshold_ms: float = 200.0,
     ) -> tuple[list[str], list[tuple[float, float]]]:
         """
         Transcribe audio file to Hindi text with timestamps.
@@ -452,6 +657,7 @@ class BaseModelTranscriber:
             word_level: If True, return word-level timestamps. If False, return character-level.
             word_gap_threshold: Time gap (in seconds) between characters to detect word boundaries.
                                Lower values = more word splits. Default: 0.12s (120ms)
+            silence_threshold_ms: End segment if blanks exceed this duration (default 200ms)
         
         Returns:
             Tuple of (words/chars, timestamps) where timestamps are (start, end) in seconds
@@ -490,57 +696,85 @@ class BaseModelTranscriber:
         
         # Frame duration in seconds
         frame_duration = self.frame_duration_ms / 1000.0
+        silence_threshold_frames = int(silence_threshold_ms / self.frame_duration_ms)
         
-        # Extract characters with timestamps using CTC collapse
+        # Extract characters with timestamps using improved CTC decoding
+        # Key fix: Don't end segment on blanks, only on DIFFERENT characters or long silence
         chars = []
         char_timestamps = []
         
-        prev_token = None
-        start_frame = 0
+        current_char_id = None
+        current_char = None
+        start_frame = None
+        last_char_frame = None
+        blank_count = 0
         
         for frame_idx, token_id in enumerate(pred_ids):
             token_id = int(token_id)
+            is_blank = (token_id == blank_id)
             
-            # Skip blank tokens
-            if token_id == blank_id:
-                if prev_token is not None and prev_token != blank_id:
-                    # End of current character
-                    end_time = frame_idx * frame_duration
+            if is_blank:
+                blank_count += 1
+                
+                # Check for silence (long blank span) - end current segment
+                if current_char is not None and blank_count >= silence_threshold_frames:
+                    end_time = (last_char_frame + 1) * frame_duration
                     start_time = start_frame * frame_duration
                     
-                    char = id_to_char.get(prev_token, "")
-                    if char and char not in ["<pad>", "<unk>", "<s>", "</s>", "|"]:
-                        # Handle special tokens like "|" as word boundary
-                        chars.append(char)
+                    if current_char and current_char not in ["<pad>", "<unk>", "<s>", "</s>", "|"]:
+                        chars.append(current_char)
                         char_timestamps.append((start_time, end_time))
+                    
+                    current_char_id = None
+                    current_char = None
+                    start_frame = None
+                    last_char_frame = None
                 
-                prev_token = token_id
                 continue
             
-            if token_id != prev_token:
-                # New character starts
-                if prev_token is not None and prev_token != blank_id:
-                    # End previous character
-                    end_time = frame_idx * frame_duration
-                    start_time = start_frame * frame_duration
-                    
-                    char = id_to_char.get(prev_token, "")
-                    if char and char not in ["<pad>", "<unk>", "<s>", "</s>", "|"]:
-                        chars.append(char)
-                        char_timestamps.append((start_time, end_time))
-                
-                start_frame = frame_idx
+            # Non-blank token
+            char = id_to_char.get(token_id, "")
             
-            prev_token = token_id
+            # Skip special tokens
+            if not char or char in ["<pad>", "<unk>", "<s>", "</s>", "|"]:
+                continue
+            
+            # Reset blank counter
+            blank_count = 0
+            
+            if current_char is None:
+                # Start new segment
+                current_char_id = token_id
+                current_char = char
+                start_frame = frame_idx
+                last_char_frame = frame_idx
+                
+            elif token_id == current_char_id:
+                # Same character continues - extend the segment
+                last_char_frame = frame_idx
+                
+            else:
+                # DIFFERENT character - end current segment and start new one
+                end_time = (last_char_frame + 1) * frame_duration
+                start_time = start_frame * frame_duration
+                
+                if current_char and current_char not in ["<pad>", "<unk>", "<s>", "</s>", "|"]:
+                    chars.append(current_char)
+                    char_timestamps.append((start_time, end_time))
+                
+                # Start new segment
+                current_char_id = token_id
+                current_char = char
+                start_frame = frame_idx
+                last_char_frame = frame_idx
         
         # Handle last character
-        if prev_token is not None and prev_token != blank_id:
-            end_time = len(pred_ids) * frame_duration
+        if current_char is not None:
+            end_time = (last_char_frame + 1) * frame_duration
             start_time = start_frame * frame_duration
             
-            char = id_to_char.get(prev_token, "")
-            if char and char not in ["<pad>", "<unk>", "<s>", "</s>", "|"]:
-                chars.append(char)
+            if current_char and current_char not in ["<pad>", "<unk>", "<s>", "</s>", "|"]:
+                chars.append(current_char)
                 char_timestamps.append((start_time, end_time))
         
         if not word_level:
@@ -735,6 +969,215 @@ def transcribe_hindi_to_srt(
         write_hindi_srt(items, timestamps, output_srt, group_words=group_words)
     
     return items, timestamps
+
+
+def _evaluate_split(
+    recognizer: PhonemeRecognizer,
+    split_data,
+    split_name: str,
+    streaming: bool = False,
+):
+    """Evaluate model on a single split and return metrics."""
+    import evaluate
+    from torch.utils.data import DataLoader
+    from tqdm import tqdm
+    from collections import Counter
+    
+    info(f"Evaluating on {len(split_data)} {split_name} samples...")
+    
+    wer_metric = evaluate.load("wer")
+    
+    all_preds = []
+    all_labels = []
+
+    # Use DataLoader for batching if not streaming
+    if not streaming:
+        dataloader = DataLoader(split_data, batch_size=1, shuffle=False)
+    else:
+        dataloader = split_data
+
+    # Live metrics tracking
+    running_per = 0.0
+    running_f1 = 0.0
+    
+    pbar = tqdm(dataloader, desc=f"Evaluating {split_name}")
+    skipped = 0
+    for batch in pbar:
+        # batch is a dict with 'input_values' and 'labels'
+        if not isinstance(batch, dict):
+            skipped += 1
+            continue
+        
+        input_values = batch.get("input_values")
+        label_ids = batch.get("labels")
+        
+        # Skip invalid/corrupted samples
+        if input_values is None or label_ids is None:
+            skipped += 1
+            continue
+        
+        # DataLoader wraps in extra dimension - unwrap if needed
+        if isinstance(input_values, torch.Tensor):
+            if input_values.dim() > 1:
+                input_values = input_values.squeeze(0)
+        elif isinstance(input_values, list) and len(input_values) > 0 and isinstance(input_values[0], list):
+            input_values = input_values[0]
+        
+        if len(input_values) == 0:
+            skipped += 1
+            continue
+            
+        input_values = torch.tensor(input_values) if not isinstance(input_values, torch.Tensor) else input_values
+        
+        # Unwrap label_ids if needed (DataLoader batching)
+        if isinstance(label_ids, torch.Tensor):
+            label_ids = label_ids.squeeze().tolist()  # squeeze all singleton dims
+        
+        # Handle list of tensors (from default collate function)
+        if isinstance(label_ids, list) and len(label_ids) > 0 and isinstance(label_ids[0], torch.Tensor):
+            label_ids = [t.item() if t.numel() == 1 else t.tolist() for t in label_ids]
+            # Flatten if any element became a list
+            if isinstance(label_ids[0], list):
+                label_ids = [item for sublist in label_ids for item in sublist]
+        
+        # Unwrap nested lists until we get a flat list of integers
+        while isinstance(label_ids, list) and len(label_ids) > 0 and isinstance(label_ids[0], (list, np.ndarray)):
+            label_ids = label_ids[0]
+        
+        # Ensure we have a flat list of ints (handle numpy arrays too)
+        if isinstance(label_ids, np.ndarray):
+            label_ids = label_ids.flatten().tolist()
+
+        # Get predictions
+        with torch.no_grad():
+            logits = recognizer.get_logits(input_values)
+            pred_ids = np.argmax(logits, axis=-1)
+            
+            # Decode for PER
+            pred_str = recognizer.processor.batch_decode([pred_ids])[0]
+            label_str = recognizer.processor.decode(label_ids, group_tokens=False)
+            
+            all_preds.append(pred_str)
+            all_labels.append(label_str)
+            
+            # Calculate live metrics every 10 samples
+            if len(all_preds) % 10 == 0 and len(all_preds) > 0:
+                running_per = wer_metric.compute(predictions=all_preds, references=all_labels)
+                
+                # Quick F1 calculation on last 100 samples
+                recent_preds = all_preds[-100:]
+                recent_labels = all_labels[-100:]
+                f1s = []
+                for p_str, l_str in zip(recent_preds, recent_labels):
+                    p_counts = Counter(p_str.split())
+                    l_counts = Counter(l_str.split())
+                    tp = sum((p_counts & l_counts).values())
+                    fp = sum((p_counts - l_counts).values())
+                    fn = sum((l_counts - p_counts).values())
+                    prec = tp / (tp + fp) if (tp + fp) > 0 else 0
+                    rec = tp / (tp + fn) if (tp + fn) > 0 else 0
+                    f1 = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0
+                    f1s.append(f1)
+                running_f1 = np.mean(f1s)
+                
+                pbar.set_postfix({
+                    "PER": f"{running_per:.2%}", 
+                    "Acc": f"{1-running_per:.2%}",
+                    "F1": f"{running_f1:.2%}"
+                })
+            
+    # Report skipped samples
+    if skipped > 0:
+        warning(f"Skipped {skipped} invalid/corrupted samples")
+    
+    # Final PER
+    per = wer_metric.compute(predictions=all_preds, references=all_labels)
+    
+    results = {
+        "Phoneme Error Rate (PER)": per,
+        "Accuracy (1 - PER)": 1.0 - per,
+    }
+    
+    # Bag-of-phonemes F1 (full calculation)
+    all_f1s = []
+    all_precs = []
+    all_recs = []
+    
+    for p_str, l_str in zip(all_preds, all_labels):
+        p_counts = Counter(p_str.split())
+        l_counts = Counter(l_str.split())
+        
+        tp = sum((p_counts & l_counts).values())
+        fp = sum((p_counts - l_counts).values())
+        fn = sum((l_counts - p_counts).values())
+        
+        prec = tp / (tp + fp) if (tp + fp) > 0 else 0
+        rec = tp / (tp + fn) if (tp + fn) > 0 else 0
+        f1 = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0
+        
+        all_f1s.append(f1)
+        all_precs.append(prec)
+        all_recs.append(rec)
+        
+    results["F1 Score (Bag-of-Phonemes)"] = np.mean(all_f1s)
+    results["Precision"] = np.mean(all_precs)
+    results["Recall"] = np.mean(all_recs)
+    
+    return results
+
+
+def evaluate_model(
+    model_path: str,
+    data_config: any,
+    device: str = None,
+    batch_size: int = 8,
+    force_reprocess: bool = False,
+    val_only: bool = False,
+):
+    """Evaluate model on validation and test sets, return metrics (PER, Accuracy, F1)."""
+    # Setup recognizer
+    config = InferenceConfig(model_path=model_path, device=device)
+    recognizer = PhonemeRecognizer(config)
+    
+    # Load dataset
+    dataset = prepare_dataset(data_config, recognizer.processor, recognizer.vocab, force_reprocess=force_reprocess, val_only=val_only)
+    
+    all_results = {}
+    
+    # Evaluate train set first (if not val_only)
+    if not val_only:
+        train_set = dataset.get("train")
+        if train_set:
+            train_results = _evaluate_split(recognizer, train_set, "train", data_config.streaming)
+            print_results(train_results, title="Train Set Evaluation")
+            all_results["train"] = train_results
+        else:
+            info("Train set not found in dataset (skipping)")
+    
+    # Then evaluate validation set
+    val_set = dataset.get("validation")
+    if val_set:
+        val_results = _evaluate_split(recognizer, val_set, "validation", data_config.streaming)
+        print_results(val_results, title="Validation Set Evaluation")
+        all_results["validation"] = val_results
+    else:
+        warning("Validation set not found in dataset")
+    
+    # Finally evaluate test set if it exists
+    if not val_only:
+        test_set = dataset.get("test")
+        if test_set:
+            test_results = _evaluate_split(recognizer, test_set, "test", data_config.streaming)
+            print_results(test_results, title="Test Set Evaluation")
+            all_results["test"] = test_results
+        else:
+            info("Test set not found in dataset (skipping)")
+    
+    if not all_results:
+        error("No validation or test set found in dataset")
+        return None
+    
+    return all_results
 
 
 if __name__ == "__main__":

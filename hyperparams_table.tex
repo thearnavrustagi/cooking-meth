@@ -1,0 +1,35 @@
+\begin{table}[t]
+  \centering
+  \caption{Training hyperparameters.}
+  \label{tab:hyperparams}
+  \small
+  \begin{tabular}{ll}
+    \toprule
+    \textbf{Hyperparameter} & \textbf{Value} \\
+    \midrule
+    Base model & Wav2Vec2-Large-XLSR-Hindi \\
+    Sampling rate & 16\,kHz \\
+    Frame duration & 20\,ms \\
+    Vocab size (phonemes) & 55 \\
+    Hidden size & 1024 \\
+    Transformer layers & 24 \\
+    Attention heads & 16 \\
+    \midrule
+    Epochs & 30 \\
+    Batch size (effective) & $4 \times 4 = 16$ \\
+    Learning rate & $3 \times 10^{-4}$ \\
+    Warmup steps & 500 \\
+    Weight decay & 0.01 \\
+    Dropout (all) & 0.0 \\
+    Layerdrop & 0.0 \\
+    SpecAugment mask prob & 0.05 \\
+    CTC loss reduction & mean \\
+    Gradient checkpointing & \checkmark \\
+    Freeze feature encoder & \checkmark \\
+    Mixed precision (fp16) & \checkmark \\
+    \midrule
+    Temporal smoothness ($\lambda_s$) & 0.2 \\
+    Blank penalty ($\lambda_b$) & 0.1 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
